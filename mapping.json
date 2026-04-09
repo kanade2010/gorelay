@@ -1,0 +1,19 @@
+{
+    "listen_rtp": "0.0.0.0:8086",
+    "listen_rtcp": "0.0.0.0:8087",
+    "listen_control": "0.0.0.0:8080",
+    "mappings": [],
+    "packet_history_ms": 1500,
+    "jitter_buffer_ms": 200,
+    "jitter_min_delay_ms": 20,
+    "jitter_max_delay_ms": 200,
+    "jitter_tick_ms": 10,
+    "jitter_up_step_ms": 20,
+    "jitter_down_step_ms": 5,
+    "jitter_log_enabled": true,
+    "jitter_log_period_ms": 2000,
+    "send_rate_bps": 20000000,
+    "enable_jitter": false,
+    "enable_pacer": true
+  }
+  
