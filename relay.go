@@ -4,8 +4,6 @@ import (
 	"net"
 	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
 type ForwardDebugState struct {
@@ -50,25 +48,26 @@ type Relay struct {
 	historyMutex      sync.Mutex
 	jitter            map[uint32]*JitterBuffer
 	jitterForwarders  map[uint32]bool
-	sendLimiter       *rate.Limiter
-	stats             *Stats
-	weakStats         WeakNetStats
-	addrTS            map[string]time.Time
-	addrTSMux         sync.RWMutex
-	rtcpSRSeen        map[string]time.Time
-	rtcpSRSeenMux     sync.Mutex
-	forwardDebug      ForwardDebugState
-	forwardDebugMux   sync.Mutex
-	debugForwardIP    string
-	forwardQueue      chan ForwardJob
-	pacers            map[string]*Pacer
-	pacerMux          sync.RWMutex
-	pacerCfgMux       sync.RWMutex
-	pacerOverrides    map[string]PacerTargetConfig
-	pcapCapture       PcapCaptureState
-	pcapCaptureMux    sync.Mutex
-	pcapCaptureCmd    any
-	pcapCaptureTimer  *time.Timer
+	// sendLimiter is intentionally disabled; pacing is handled by per-target pacers.
+	// sendLimiter       *rate.Limiter
+	stats            *Stats
+	weakStats        WeakNetStats
+	addrTS           map[string]time.Time
+	addrTSMux        sync.RWMutex
+	rtcpSRSeen       map[string]time.Time
+	rtcpSRSeenMux    sync.Mutex
+	forwardDebug     ForwardDebugState
+	forwardDebugMux  sync.Mutex
+	debugForwardIP   string
+	forwardQueue     chan ForwardJob
+	pacers           map[string]*Pacer
+	pacerMux         sync.RWMutex
+	pacerCfgMux      sync.RWMutex
+	pacerOverrides   map[string]PacerTargetConfig
+	pcapCapture      PcapCaptureState
+	pcapCaptureMux   sync.Mutex
+	pcapCaptureCmd   any
+	pcapCaptureTimer *time.Timer
 }
 
 func NewRelay(cfg *Config) *Relay {
@@ -85,8 +84,8 @@ func NewRelay(cfg *Config) *Relay {
 		history:           make(map[uint32]*PacketHistory),
 		jitter:            make(map[uint32]*JitterBuffer),
 		jitterForwarders:  make(map[uint32]bool),
-		sendLimiter:       rate.NewLimiter(rate.Limit(cfg.SendRateBps), cfg.SendRateBps),
-		stats:             &Stats{lastUpdated: time.Now()},
+		// sendLimiter:       rate.NewLimiter(rate.Limit(cfg.SendRateBps), cfg.SendRateBps),
+		stats: &Stats{lastUpdated: time.Now()},
 		weakStats: WeakNetStats{
 			Stats:        make(map[string]*AddrWeakSeries),
 			KeyReqTotals: make(map[string]*KeyframeTotals),

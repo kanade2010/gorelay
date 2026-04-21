@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/pion/rtcp"
-	"golang.org/x/time/rate"
 )
 
 func (r *Relay) handleRTCPPacket(p rtcp.Packet, addr *net.UDPAddr) {
@@ -163,35 +162,68 @@ func ntpMiddle32ToTime(lsr uint32) time.Time {
 	return ntpEpoch.Add(time.Duration(seconds * float64(time.Second)))
 }
 
+func (r *Relay) collectPacersForReporter(addr *net.UDPAddr) []*Pacer {
+	if addr == nil {
+		return nil
+	}
+	reporterKey := addr.String()
+	reporterIP := ""
+	if addr.IP != nil {
+		reporterIP = addr.IP.String()
+	}
+
+	r.pacerMux.RLock()
+	defer r.pacerMux.RUnlock()
+
+	seen := make(map[*Pacer]struct{})
+	out := make([]*Pacer, 0, 4)
+	appendUnique := func(p *Pacer) {
+		if p == nil {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+
+	appendUnique(r.pacers[reporterKey])
+	if reporterIP != "" {
+		for key, p := range r.pacers {
+			ip, ok := ipFromTargetKey(key)
+			if !ok || ip != reporterIP {
+				continue
+			}
+			appendUnique(p)
+		}
+	}
+	return out
+}
+
+func (r *Relay) applyRRLossFeedback(addr *net.UDPAddr, fractionLost uint8) {
+	pacers := r.collectPacersForReporter(addr)
+	for _, p := range pacers {
+		if p == nil {
+			continue
+		}
+		pcfg := p.Config()
+		if !pcfg.Enabled {
+			continue
+		}
+		p.ApplyRTCPFractionLoss(fractionLost)
+	}
+}
+
 func (r *Relay) handleRR(rr *rtcp.ReceiverReport, addr *net.UDPAddr) {
 	now := time.Now()
 	r.stats.mu.Lock()
 	r.stats.lastUpdated = now
 	r.stats.mu.Unlock()
+	maxFractionLost := uint8(0)
 	for _, rep := range rr.Reports {
-		fracLoss := float64(rep.FractionLost) / 256.0
-		if fracLoss > 0.05 {
-			newRate := int(float64(r.cfg.SendRateBps) * (1 - fracLoss))
-			if newRate < 8000000 {
-				newRate = 8000000
-			}
-			log.Printf("RR: high loss %f => reduce rate to %d\n", fracLoss, newRate)
-			r.sendLimiter.SetLimit(rate.Limit(newRate))
-			r.pacerMux.RLock()
-			pacers := make([]*Pacer, 0, len(r.pacers))
-			for _, p := range r.pacers {
-				if p != nil {
-					pacers = append(pacers, p)
-				}
-			}
-			r.pacerMux.RUnlock()
-			for _, p := range pacers {
-				pcfg := p.Config()
-				pcfg.Enabled = true
-				pcfg.RateBps = newRate
-				pcfg.RateBytesPerSec = newRate / 8
-				p.UpdateConfig(pcfg)
-			}
+		if rep.FractionLost > maxFractionLost {
+			maxFractionLost = rep.FractionLost
 		}
 		if rep.LastSenderReport == 0 {
 			continue
@@ -206,6 +238,9 @@ func (r *Relay) handleRR(rr *rtcp.ReceiverReport, addr *net.UDPAddr) {
 		}
 		r.weakStats.UpdateRTT(addr.String(), rtt)
 	}
+	if len(rr.Reports) > 0 {
+		r.applyRRLossFeedback(addr, maxFractionLost)
+	}
 }
 
 func (r *Relay) retransmitToMapping(ssrc uint32, pkt []byte) {
@@ -219,23 +254,13 @@ func (r *Relay) retransmitToMapping(ssrc uint32, pkt []byte) {
 			if addr == nil {
 				continue
 			}
-			job := ForwardJob{
-				ssrc:    ssrc,
-				srcAddr: "",
-				target:  addr,
-				pkt:     append([]byte(nil), pkt...),
-				prio:    PacerPriorityHigh,
-				counted: false,
+			// RTCP-triggered retransmit bypasses pacer and forwards directly.
+			if _, err := r.rtpConn.WriteToUDP(pkt, addr); err != nil {
+				log.Printf("[ERROR][rtcp-retransmit] write_failed target=%s ssrc=%d len=%d err=%v",
+					addr.String(), ssrc, len(pkt), err)
+				continue
 			}
-			if ok, reason := r.enqueueToPacer(job); !ok {
-				st := PacerStats{}
-				if pst, _, exists := r.getPacerStatsForTarget(addr); exists {
-					st = pst
-				}
-				log.Printf("[ERROR][pacer] retransmit_enqueue_failed reason=%s target=%s ssrc=%d len=%d queue_packets=%d queue_bytes=%d queue_flows=%d",
-					reason, addr.String(), ssrc, len(pkt),
-					st.QueuePackets, st.QueueBytes, st.QueueFlows)
-			}
+			r.debugForwardPacket(addr.String(), "", ssrc, pkt)
 		}
 	}
 }

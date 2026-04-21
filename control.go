@@ -10,8 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
 type UpdateAddrMappingRequest struct {
@@ -44,14 +42,50 @@ type UpdateJitterParamsRequest struct {
 }
 
 type UpdatePacerRequest struct {
-	Target       string `json:"target"`
-	DeleteTarget *bool  `json:"delete_target"`
-	EnablePacer  *bool  `json:"enable_pacer"`
-	RateBps      *int   `json:"rate_bps"`
-	SendRateBps  *int   `json:"send_rate_bps"`
-	TickMS       *int   `json:"tick_ms"`
-	LogEnabled   *bool  `json:"log_enabled"`
-	LogPeriodMS  *int   `json:"log_period_ms"`
+	Target              string `json:"target"`
+	DeleteTarget        *bool  `json:"delete_target"`
+	EnablePacer         *bool  `json:"enable_pacer"`
+	EnablePacerAdaptive *bool  `json:"enable_pacer_adaptive"`
+	RateBps             *int   `json:"rate_bps"`
+	SendRateBps         *int   `json:"send_rate_bps"`
+	TickMS              *int   `json:"tick_ms"`
+	LogEnabled          *bool  `json:"log_enabled"`
+	LogPeriodMS         *int   `json:"log_period_ms"`
+}
+
+type UpdatePacerIPProfileRequest struct {
+	IP          string `json:"ip"`
+	Delete      *bool  `json:"delete"`
+	EnablePacer *bool  `json:"enable_pacer"`
+	RateBps     *int   `json:"rate_bps"`
+	SendRateBps *int   `json:"send_rate_bps"`
+}
+
+type UpdatePacerAdaptiveRequest struct {
+	ShortEWMAMS              *int     `json:"short_ewma_ms"`
+	LongEWMAMS               *int     `json:"long_ewma_ms"`
+	ShortHeadroom            *float64 `json:"short_headroom"`
+	LongHeadroom             *float64 `json:"long_headroom"`
+	RTXReservePct            *float64 `json:"rtx_reserve_pct"`
+	RTCPOverheadPct          *float64 `json:"rtcp_overhead_pct"`
+	StartRateBps             *int     `json:"start_rate_bps"`
+	FloorRateBps             *int     `json:"floor_rate_bps"`
+	QueueDelayTargetMS       *int     `json:"queue_delay_target_ms"`
+	QueueHighWatermarkMS     *int     `json:"queue_high_watermark_ms"`
+	QueueSustainMS           *int     `json:"queue_sustain_ms"`
+	QueueBoostFactor         *float64 `json:"queue_boost_factor"`
+	ForceHardCapQueueDelayMS *int     `json:"force_hard_cap_queue_delay_ms"`
+	TargetMaxUpPerSec        *float64 `json:"target_max_up_per_sec"`
+	FeedbackLossHigh         *float64 `json:"feedback_loss_high"`
+	FeedbackLossMid          *float64 `json:"feedback_loss_mid"`
+	FeedbackDropHigh         *float64 `json:"feedback_drop_high"`
+	FeedbackDropMid          *float64 `json:"feedback_drop_mid"`
+	FeedbackMinScale         *float64 `json:"feedback_min_scale"`
+	FeedbackRecoverGain      *float64 `json:"feedback_recover_gain"`
+	FeedbackRecoverMS        *int     `json:"feedback_recover_ms"`
+	FeedbackStepMS           *int     `json:"feedback_step_ms"`
+	FeedbackMidCount         *int     `json:"feedback_mid_count"`
+	FeedbackEnabled          *bool    `json:"feedback_enabled"`
 }
 
 type JitterParams struct {
@@ -67,6 +101,58 @@ type JitterParams struct {
 	JitterLogEnabled       bool     `json:"jitter_log_enabled"`
 	JitterLogPeriodMS      int      `json:"jitter_log_period_ms"`
 	JitterSourceIPs        []string `json:"jitter_source_ips"`
+}
+
+func (r *Relay) applyConfigToRuntime(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	r.cfg = cfg
+
+	// sendLimiter is disabled; pacing is handled by per-target pacers.
+
+	startWorkers := make([]struct {
+		ssrc uint32
+		jb   *JitterBuffer
+	}, 0)
+
+	r.historyMutex.Lock()
+	for _, ph := range r.history {
+		if ph == nil {
+			continue
+		}
+		ph.UpdateMaxMS(cfg.PacketHistoryMS)
+	}
+	for ssrc, jb := range r.jitter {
+		if jb == nil {
+			continue
+		}
+		jb.SetEnabled(cfg.EnableJitter)
+		jb.UpdateParams(
+			cfg.JitterMinDelayMS,
+			cfg.JitterMaxDelayMS,
+			cfg.JitterTickMS,
+			cfg.JitterUpStepMS,
+			cfg.JitterDownStepMS,
+			cfg.JitterLogEnabled,
+			cfg.JitterLogPeriodMS,
+		)
+		if cfg.EnableJitter && !r.jitterForwarders[ssrc] {
+			r.jitterForwarders[ssrc] = true
+			startWorkers = append(startWorkers, struct {
+				ssrc uint32
+				jb   *JitterBuffer
+			}{ssrc: ssrc, jb: jb})
+		}
+	}
+	r.historyMutex.Unlock()
+
+	for _, wkr := range startWorkers {
+		log.Printf("[jitter][ssrc=%d] start forward worker", wkr.ssrc)
+		go r.forwardFromJitter(wkr.ssrc, wkr.jb)
+	}
+
+	r.applyResolvedParamsToAllPacers()
 }
 
 func currentJitterParams(cfg *Config) JitterParams {
@@ -118,6 +204,119 @@ func normalizeJitterParams(p *JitterParams) {
 	}
 	if p.JitterSourceIPs == nil {
 		p.JitterSourceIPs = []string{}
+	}
+}
+
+func currentPacerAdaptiveParams(cfg *Config) PacerAdaptiveConfig {
+	p := cfg.PacerAdaptive
+	normalizePacerAdaptiveConfig(&p)
+	return p
+}
+
+func mergePacerAdaptiveParams(base PacerAdaptiveConfig, req *UpdatePacerAdaptiveRequest) PacerAdaptiveConfig {
+	p := base
+	if req.ShortEWMAMS != nil {
+		p.ShortEWMAMS = *req.ShortEWMAMS
+	}
+	if req.LongEWMAMS != nil {
+		p.LongEWMAMS = *req.LongEWMAMS
+	}
+	if req.ShortHeadroom != nil {
+		p.ShortHeadroom = *req.ShortHeadroom
+	}
+	if req.LongHeadroom != nil {
+		p.LongHeadroom = *req.LongHeadroom
+	}
+	if req.RTXReservePct != nil {
+		p.RTXReservePct = *req.RTXReservePct
+	}
+	if req.RTCPOverheadPct != nil {
+		p.RTCPOverheadPct = *req.RTCPOverheadPct
+	}
+	if req.StartRateBps != nil {
+		p.StartRateBps = *req.StartRateBps
+	}
+	if req.FloorRateBps != nil {
+		p.FloorRateBps = *req.FloorRateBps
+	}
+	if req.QueueDelayTargetMS != nil {
+		p.QueueDelayTargetMS = *req.QueueDelayTargetMS
+	}
+	if req.QueueHighWatermarkMS != nil {
+		p.QueueHighWatermarkMS = *req.QueueHighWatermarkMS
+	}
+	if req.QueueSustainMS != nil {
+		p.QueueSustainMS = *req.QueueSustainMS
+	}
+	if req.QueueBoostFactor != nil {
+		p.QueueBoostFactor = *req.QueueBoostFactor
+	}
+	if req.ForceHardCapQueueDelayMS != nil {
+		p.ForceHardCapQueueDelayMS = *req.ForceHardCapQueueDelayMS
+	}
+	if req.TargetMaxUpPerSec != nil {
+		p.TargetMaxUpPerSec = *req.TargetMaxUpPerSec
+	}
+	if req.FeedbackLossHigh != nil {
+		p.FeedbackLossHigh = *req.FeedbackLossHigh
+	}
+	if req.FeedbackLossMid != nil {
+		p.FeedbackLossMid = *req.FeedbackLossMid
+	}
+	if req.FeedbackDropHigh != nil {
+		p.FeedbackDropHigh = *req.FeedbackDropHigh
+	}
+	if req.FeedbackDropMid != nil {
+		p.FeedbackDropMid = *req.FeedbackDropMid
+	}
+	if req.FeedbackMinScale != nil {
+		p.FeedbackMinScale = *req.FeedbackMinScale
+	}
+	if req.FeedbackRecoverGain != nil {
+		p.FeedbackRecoverGain = *req.FeedbackRecoverGain
+	}
+	if req.FeedbackRecoverMS != nil {
+		p.FeedbackRecoverMS = *req.FeedbackRecoverMS
+	}
+	if req.FeedbackStepMS != nil {
+		p.FeedbackStepMS = *req.FeedbackStepMS
+	}
+	if req.FeedbackMidCount != nil {
+		p.FeedbackMidCount = *req.FeedbackMidCount
+	}
+	if req.FeedbackEnabled != nil {
+		p.FeedbackEnabled = *req.FeedbackEnabled
+	}
+	normalizePacerAdaptiveConfig(&p)
+	return p
+}
+
+func pacerAdaptiveToPatchMap(p PacerAdaptiveConfig) map[string]any {
+	return map[string]any{
+		"short_ewma_ms":                 p.ShortEWMAMS,
+		"long_ewma_ms":                  p.LongEWMAMS,
+		"short_headroom":                p.ShortHeadroom,
+		"long_headroom":                 p.LongHeadroom,
+		"rtx_reserve_pct":               p.RTXReservePct,
+		"rtcp_overhead_pct":             p.RTCPOverheadPct,
+		"start_rate_bps":                p.StartRateBps,
+		"floor_rate_bps":                p.FloorRateBps,
+		"queue_delay_target_ms":         p.QueueDelayTargetMS,
+		"queue_high_watermark_ms":       p.QueueHighWatermarkMS,
+		"queue_sustain_ms":              p.QueueSustainMS,
+		"queue_boost_factor":            p.QueueBoostFactor,
+		"force_hard_cap_queue_delay_ms": p.ForceHardCapQueueDelayMS,
+		"target_max_up_per_sec":         p.TargetMaxUpPerSec,
+		"feedback_loss_high":            p.FeedbackLossHigh,
+		"feedback_loss_mid":             p.FeedbackLossMid,
+		"feedback_drop_high":            p.FeedbackDropHigh,
+		"feedback_drop_mid":             p.FeedbackDropMid,
+		"feedback_min_scale":            p.FeedbackMinScale,
+		"feedback_recover_gain":         p.FeedbackRecoverGain,
+		"feedback_recover_ms":           p.FeedbackRecoverMS,
+		"feedback_step_ms":              p.FeedbackStepMS,
+		"feedback_mid_count":            p.FeedbackMidCount,
+		"feedback_enabled":              p.FeedbackEnabled,
 	}
 }
 
@@ -281,6 +480,66 @@ func (r *Relay) handleUpdateJitterParams(w http.ResponseWriter, req *http.Reques
 	})
 }
 
+func (r *Relay) handleUpdatePacerAdaptive(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if req.Method == http.MethodGet {
+		out := currentPacerAdaptiveParams(r.cfg)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":             true,
+			"pacer_adaptive": out,
+			"path":           r.cfg.ConfigPath,
+		})
+		return
+	}
+
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body UpdatePacerAdaptiveRequest
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	next := mergePacerAdaptiveParams(currentPacerAdaptiveParams(r.cfg), &body)
+
+	r.pacerCfgMux.Lock()
+	r.cfg.PacerAdaptive = next
+	r.pacerCfgMux.Unlock()
+	r.applyResolvedParamsToAllPacers()
+
+	if err := saveConfigPatch(r.cfg.ConfigPath, map[string]any{
+		"pacer_adaptive": pacerAdaptiveToPatchMap(next),
+	}); err != nil {
+		http.Error(w, fmt.Sprintf("save config failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[pacer-adaptive] params updated and persisted: short=%dms long=%dms headroom(short/long)=%.3f/%.3f reserve(rtx/rtcp)=%.3f/%.3f start=%dbps floor=%dbps queue(target/high/sustain)=%d/%d/%dms boost=%.3f force_cap_qdelay=%dms target_max_up_per_sec=%.3f feedback(enabled)=%t loss(high/mid)=%.3f/%.3f drop(high/mid)=%.3f/%.3f min_scale=%.3f recover(gain/ms/step)=%.3f/%d/%d mid_count=%d path=%s",
+		next.ShortEWMAMS, next.LongEWMAMS,
+		next.ShortHeadroom, next.LongHeadroom,
+		next.RTXReservePct, next.RTCPOverheadPct,
+		next.StartRateBps,
+		next.FloorRateBps,
+		next.QueueDelayTargetMS, next.QueueHighWatermarkMS, next.QueueSustainMS, next.QueueBoostFactor, next.ForceHardCapQueueDelayMS, next.TargetMaxUpPerSec,
+		next.FeedbackEnabled,
+		next.FeedbackLossHigh, next.FeedbackLossMid,
+		next.FeedbackDropHigh, next.FeedbackDropMid, next.FeedbackMinScale,
+		next.FeedbackRecoverGain, next.FeedbackRecoverMS, next.FeedbackStepMS, next.FeedbackMidCount,
+		r.cfg.ConfigPath,
+	)
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":             true,
+		"saved":          true,
+		"path":           r.cfg.ConfigPath,
+		"pacer_adaptive": next,
+	})
+}
+
 func (r *Relay) handleForwardDebugTarget(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if req.Method == http.MethodGet {
@@ -317,6 +576,149 @@ func (r *Relay) handleForwardDebugTarget(w http.ResponseWriter, req *http.Reques
 	})
 }
 
+func (r *Relay) handleUpdateConfig(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if req.Method == http.MethodGet {
+		data, err := os.ReadFile(r.cfg.ConfigPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("read config failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		// Return exactly what is in config file.
+		w.Write(data)
+		return
+	}
+
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var patch map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&patch); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if len(patch) == 0 {
+		http.Error(w, "empty patch", http.StatusBadRequest)
+		return
+	}
+
+	if err := saveConfigPatch(r.cfg.ConfigPath, patch); err != nil {
+		http.Error(w, fmt.Sprintf("save config failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	cfg, err := loadConfig(r.cfg.ConfigPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("reload config failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	r.applyConfigToRuntime(cfg)
+
+	keys := make([]string, 0, len(patch))
+	for k := range patch {
+		keys = append(keys, k)
+	}
+	log.Printf("[config] patched and reloaded: keys=%v path=%s", keys, r.cfg.ConfigPath)
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"saved": true,
+		"path":  r.cfg.ConfigPath,
+		"keys":  keys,
+		"config": map[string]any{
+			"listen_rtp":            r.cfg.ListenRTP,
+			"listen_rtcp":           r.cfg.ListenRTCP,
+			"listen_control":        r.cfg.ListenControl,
+			"send_rate_bps":         r.cfg.SendRateBps,
+			"enable_pacer":          r.cfg.EnablePacer,
+			"enable_pacer_adaptive": r.cfg.EnablePacerAdaptive,
+			"pacer_adaptive":        r.cfg.PacerAdaptive,
+			"pacer_ip_profiles":     r.cfg.PacerIPProfiles,
+			"jitter": map[string]any{
+				"enable_jitter":             r.cfg.EnableJitter,
+				"jitter_source_ips_enabled": r.cfg.JitterSourceIPsEnabled,
+				"packet_history_ms":         r.cfg.PacketHistoryMS,
+				"jitter_buffer_ms":          r.cfg.JitterBufferMS,
+				"jitter_min_delay_ms":       r.cfg.JitterMinDelayMS,
+				"jitter_max_delay_ms":       r.cfg.JitterMaxDelayMS,
+				"jitter_tick_ms":            r.cfg.JitterTickMS,
+				"jitter_up_step_ms":         r.cfg.JitterUpStepMS,
+				"jitter_down_step_ms":       r.cfg.JitterDownStepMS,
+				"jitter_log_enabled":        r.cfg.JitterLogEnabled,
+				"jitter_log_period_ms":      r.cfg.JitterLogPeriodMS,
+				"jitter_source_ips":         r.cfg.JitterSourceIPs,
+			},
+		},
+	})
+}
+
+func (r *Relay) handleReplaceConfig(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var full map[string]any
+	if err := json.NewDecoder(req.Body).Decode(&full); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if len(full) == 0 {
+		http.Error(w, "empty config", http.StatusBadRequest)
+		return
+	}
+
+	cfg, err := saveConfigReplace(r.cfg.ConfigPath, full)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("replace config failed: %v", err), http.StatusBadRequest)
+		return
+	}
+	r.applyConfigToRuntime(cfg)
+
+	keys := make([]string, 0, len(full))
+	for k := range full {
+		keys = append(keys, k)
+	}
+	log.Printf("[config] replaced and reloaded: keys=%v path=%s", keys, r.cfg.ConfigPath)
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"saved": true,
+		"mode":  "replace",
+		"path":  r.cfg.ConfigPath,
+		"keys":  keys,
+		"config": map[string]any{
+			"listen_rtp":            r.cfg.ListenRTP,
+			"listen_rtcp":           r.cfg.ListenRTCP,
+			"listen_control":        r.cfg.ListenControl,
+			"send_rate_bps":         r.cfg.SendRateBps,
+			"enable_pacer":          r.cfg.EnablePacer,
+			"enable_pacer_adaptive": r.cfg.EnablePacerAdaptive,
+			"pacer_adaptive":        r.cfg.PacerAdaptive,
+			"pacer_ip_profiles":     r.cfg.PacerIPProfiles,
+			"jitter": map[string]any{
+				"enable_jitter":             r.cfg.EnableJitter,
+				"jitter_source_ips_enabled": r.cfg.JitterSourceIPsEnabled,
+				"packet_history_ms":         r.cfg.PacketHistoryMS,
+				"jitter_buffer_ms":          r.cfg.JitterBufferMS,
+				"jitter_min_delay_ms":       r.cfg.JitterMinDelayMS,
+				"jitter_max_delay_ms":       r.cfg.JitterMaxDelayMS,
+				"jitter_tick_ms":            r.cfg.JitterTickMS,
+				"jitter_up_step_ms":         r.cfg.JitterUpStepMS,
+				"jitter_down_step_ms":       r.cfg.JitterDownStepMS,
+				"jitter_log_enabled":        r.cfg.JitterLogEnabled,
+				"jitter_log_period_ms":      r.cfg.JitterLogPeriodMS,
+				"jitter_source_ips":         r.cfg.JitterSourceIPs,
+			},
+		},
+	})
+}
+
 func (r *Relay) handleUpdatePacer(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -324,6 +726,9 @@ func (r *Relay) handleUpdatePacer(w http.ResponseWriter, req *http.Request) {
 		p := base
 		if body.EnablePacer != nil {
 			p.EnablePacer = *body.EnablePacer
+		}
+		if body.EnablePacerAdaptive != nil {
+			p.EnablePacerAdaptive = *body.EnablePacerAdaptive
 		}
 		if body.RateBps != nil {
 			p.SendRateBps = *body.RateBps
@@ -410,18 +815,19 @@ func (r *Relay) handleUpdatePacer(w http.ResponseWriter, req *http.Request) {
 		overrides := r.snapshotPacerOverrides()
 		activeCount, runningCount, queuePackets, queueBytes, queueFlows := aggregateRuntime()
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":               true,
-			"mode":             "per-target",
-			"default":          defaults,
-			"enable_pacer":     defaults.EnablePacer,
-			"rate_bps":         defaults.SendRateBps,
-			"target_overrides": overrides,
-			"active_pacers":    activeCount,
-			"running_pacers":   runningCount,
-			"queue_packets":    queuePackets,
-			"queue_bytes":      queueBytes,
-			"queue_flows":      queueFlows,
-			"path":             r.cfg.ConfigPath,
+			"ok":                    true,
+			"mode":                  "per-target",
+			"default":               defaults,
+			"enable_pacer":          defaults.EnablePacer,
+			"enable_pacer_adaptive": defaults.EnablePacerAdaptive,
+			"rate_bps":              defaults.SendRateBps,
+			"target_overrides":      overrides,
+			"active_pacers":         activeCount,
+			"running_pacers":        runningCount,
+			"queue_packets":         queuePackets,
+			"queue_bytes":           queueBytes,
+			"queue_flows":           queueFlows,
+			"path":                  r.cfg.ConfigPath,
 		})
 		return
 	}
@@ -442,6 +848,10 @@ func (r *Relay) handleUpdatePacer(w http.ResponseWriter, req *http.Request) {
 		targetKey, err := normalizePacerTargetKey(targetRaw)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if body.EnablePacerAdaptive != nil {
+			http.Error(w, "enable_pacer_adaptive requires global default update (without target)", http.StatusBadRequest)
 			return
 		}
 
@@ -523,35 +933,158 @@ func (r *Relay) handleUpdatePacer(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	r.setGlobalPacerDefaults(next.EnablePacer, next.SendRateBps)
-	if r.sendLimiter != nil {
-		r.sendLimiter.SetLimit(rate.Limit(next.SendRateBps))
-	}
+	r.setGlobalPacerDefaults(next.EnablePacer, next.EnablePacerAdaptive, next.SendRateBps)
+	// sendLimiter is disabled; pacing is handled by per-target pacers.
 	r.applyResolvedParamsToAllPacers()
 
 	if err := saveConfigPatch(r.cfg.ConfigPath, map[string]any{
-		"enable_pacer":  next.EnablePacer,
-		"send_rate_bps": next.SendRateBps,
+		"enable_pacer":          next.EnablePacer,
+		"enable_pacer_adaptive": next.EnablePacerAdaptive,
+		"send_rate_bps":         next.SendRateBps,
 	}); err != nil {
 		http.Error(w, fmt.Sprintf("save config failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[pacer] default updated and persisted: enable=%t rate=%dbps path=%s", next.EnablePacer, next.SendRateBps, r.cfg.ConfigPath)
+	log.Printf("[pacer] default updated and persisted: enable=%t adaptive=%t rate=%dbps path=%s", next.EnablePacer, next.EnablePacerAdaptive, next.SendRateBps, r.cfg.ConfigPath)
 	activeCount, runningCount, queuePackets, queueBytes, queueFlows := aggregateRuntime()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":             true,
-		"saved":          true,
-		"path":           r.cfg.ConfigPath,
-		"mode":           "per-target",
-		"default":        next,
-		"enable_pacer":   next.EnablePacer,
-		"rate_bps":       next.SendRateBps,
-		"active_pacers":  activeCount,
-		"running_pacers": runningCount,
-		"queue_packets":  queuePackets,
-		"queue_bytes":    queueBytes,
-		"queue_flows":    queueFlows,
+		"ok":                    true,
+		"saved":                 true,
+		"path":                  r.cfg.ConfigPath,
+		"mode":                  "per-target",
+		"default":               next,
+		"enable_pacer":          next.EnablePacer,
+		"enable_pacer_adaptive": next.EnablePacerAdaptive,
+		"rate_bps":              next.SendRateBps,
+		"active_pacers":         activeCount,
+		"running_pacers":        runningCount,
+		"queue_packets":         queuePackets,
+		"queue_bytes":           queueBytes,
+		"queue_flows":           queueFlows,
+	})
+}
+
+func (r *Relay) handleUpdatePacerIPProfile(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if req.Method == http.MethodGet {
+		ipRaw := strings.TrimSpace(req.URL.Query().Get("ip"))
+		if ipRaw != "" {
+			ip, err := normalizePacerProfileIP(ipRaw)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			profile, exists := r.getPacerIPProfile(ip)
+			enableDefault, rateDefault := r.getGlobalPacerDefaults()
+			effective := PacerIPProfile{
+				EnablePacer: enableDefault,
+				SendRateBps: rateDefault,
+			}
+			if exists {
+				effective = profile
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":             true,
+				"ip":             ip,
+				"profile_exists": exists,
+				"profile":        profile,
+				"effective":      effective,
+				"path":           r.cfg.ConfigPath,
+			})
+			return
+		}
+		profiles := r.snapshotPacerIPProfiles()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":       true,
+			"profiles": profiles,
+			"count":    len(profiles),
+			"path":     r.cfg.ConfigPath,
+		})
+		return
+	}
+
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body UpdatePacerIPProfileRequest
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	ip, err := normalizePacerProfileIP(body.IP)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if body.Delete != nil && *body.Delete {
+		r.deletePacerIPProfile(ip)
+		r.applyPacerIPProfileToExistingPacers(ip)
+		if err := saveConfigPatch(r.cfg.ConfigPath, map[string]any{
+			"pacer_ip_profiles": r.snapshotPacerIPProfiles(),
+		}); err != nil {
+			http.Error(w, fmt.Sprintf("save config failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		enableDefault, rateDefault := r.getGlobalPacerDefaults()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":      true,
+			"saved":   true,
+			"deleted": true,
+			"ip":      ip,
+			"effective": PacerIPProfile{
+				EnablePacer: enableDefault,
+				SendRateBps: rateDefault,
+			},
+			"path": r.cfg.ConfigPath,
+		})
+		return
+	}
+
+	enableDefault, rateDefault := r.getGlobalPacerDefaults()
+	next := PacerIPProfile{
+		EnablePacer: enableDefault,
+		SendRateBps: rateDefault,
+	}
+	if existing, ok := r.getPacerIPProfile(ip); ok {
+		next = existing
+	}
+	if body.EnablePacer != nil {
+		next.EnablePacer = *body.EnablePacer
+	}
+	if body.RateBps != nil {
+		next.SendRateBps = *body.RateBps
+	} else if body.SendRateBps != nil {
+		next.SendRateBps = *body.SendRateBps
+	}
+	if err := validatePacerIPProfile(ip, next); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	r.setPacerIPProfile(ip, next)
+	r.applyPacerIPProfileToExistingPacers(ip)
+
+	if err := saveConfigPatch(r.cfg.ConfigPath, map[string]any{
+		"pacer_ip_profiles": r.snapshotPacerIPProfiles(),
+	}); err != nil {
+		http.Error(w, fmt.Sprintf("save config failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[pacer] ip profile updated and persisted: ip=%s enable=%t rate=%dbps path=%s",
+		ip, next.EnablePacer, next.SendRateBps, r.cfg.ConfigPath)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":      true,
+		"saved":   true,
+		"ip":      ip,
+		"profile": next,
+		"path":    r.cfg.ConfigPath,
 	})
 }
 
@@ -826,6 +1359,10 @@ func (r *Relay) controlLoop() {
 	http.HandleFunc("/update-addrmapping", r.handleUpdateAddrMapping)
 	http.HandleFunc("/update/jitter", r.handleUpdateJitterParams)
 	http.HandleFunc("/update/pacer", r.handleUpdatePacer)
+	http.HandleFunc("/update/pacer/adaptive", r.handleUpdatePacerAdaptive)
+	http.HandleFunc("/update/pacer/ip", r.handleUpdatePacerIPProfile)
+	http.HandleFunc("/update/config", r.handleUpdateConfig)
+	http.HandleFunc("/update/config/replace", r.handleReplaceConfig)
 	http.HandleFunc("/remove-addrmapping", r.handleRemoveAddrMapping)
 	http.HandleFunc("/debug/mappings", r.handleDebugMappings)
 	http.HandleFunc("/debug/mapping/json", r.handleDebugMappingJSON)

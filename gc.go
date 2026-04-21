@@ -124,6 +124,71 @@ func (r *Relay) cleanupAddr(addr string) {
 	r.addrTSMux.Unlock()
 }
 
+func (r *Relay) collectActivePacerTargets() map[string]struct{} {
+	active := make(map[string]struct{})
+
+	r.mapMutex.RLock()
+	for _, targets := range r.mapping {
+		for _, t := range targets {
+			if t == nil {
+				continue
+			}
+			active[t.String()] = struct{}{}
+		}
+	}
+	r.mapMutex.RUnlock()
+
+	r.addrMutex.RLock()
+	for _, targets := range r.addrMapping {
+		for _, t := range targets {
+			if t == nil {
+				continue
+			}
+			active[t.String()] = struct{}{}
+		}
+	}
+	r.addrMutex.RUnlock()
+
+	return active
+}
+
+// cleanupStalePacers removes pacers that are no longer referenced by any
+// active mapping target to prevent idle pacer logs from running forever.
+func (r *Relay) cleanupStalePacers() int {
+	activeTargets := r.collectActivePacerTargets()
+
+	var staleKeys []string
+	var stalePacers []*Pacer
+
+	r.pacerMux.Lock()
+	for key, p := range r.pacers {
+		if _, ok := activeTargets[key]; ok {
+			continue
+		}
+		staleKeys = append(staleKeys, key)
+		stalePacers = append(stalePacers, p)
+		delete(r.pacers, key)
+	}
+	r.pacerMux.Unlock()
+
+	for _, p := range stalePacers {
+		if p != nil {
+			p.Stop()
+		}
+	}
+
+	if len(staleKeys) > 0 {
+		r.pacerCfgMux.Lock()
+		for _, key := range staleKeys {
+			delete(r.pacerOverrides, key)
+		}
+		r.pacerCfgMux.Unlock()
+		log.Printf("[GC] cleaned pacers=%d", len(staleKeys))
+	}
+
+	return len(staleKeys)
+}
+
 func (r *Relay) updateSSRC() {
 	now := time.Now()
 	TimeNow = now
@@ -161,9 +226,11 @@ func (r *Relay) updateSSRC() {
 		r.cleanupAddr(addr)
 	}
 
-	if len(deadSSRC) > 0 || len(deadAddr) > 0 {
-		log.Printf("[GC] cleaned ssrc=%d addr=%d",
-			len(deadSSRC), len(deadAddr))
+	deadPacers := r.cleanupStalePacers()
+
+	if len(deadSSRC) > 0 || len(deadAddr) > 0 || deadPacers > 0 {
+		log.Printf("[GC] cleaned ssrc=%d addr=%d pacer=%d",
+			len(deadSSRC), len(deadAddr), deadPacers)
 	}
 
 	var reCheckAddr []string
