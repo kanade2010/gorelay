@@ -76,3 +76,17 @@ func (ph *PacketHistory) Get(seq uint16) ([]byte, bool) {
 	}
 	return e.Bytes, true
 }
+
+func (ph *PacketHistory) Snapshot(now time.Time) (size int, maxMs int, lastAgeMs int64, lastSeq uint16) {
+	ph.mu.RLock()
+	defer ph.mu.RUnlock()
+	size = len(ph.entries)
+	maxMs = ph.maxMs
+	lastSeq = ph.lastSeq
+	if ph.lastTime.IsZero() {
+		lastAgeMs = -1
+	} else {
+		lastAgeMs = now.Sub(ph.lastTime).Milliseconds()
+	}
+	return
+}

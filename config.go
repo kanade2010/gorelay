@@ -86,6 +86,7 @@ type Config struct {
 	PacerAdaptive       PacerAdaptiveConfig       `json:"pacer_adaptive,omitempty"`
 	PacerIPProfiles     map[string]PacerIPProfile `json:"pacer_ip_profiles,omitempty"`
 	Jitter              JitterConfig              `json:"jitter,omitempty"`
+	WeakNet             WeakNetConfig             `json:"weaknet,omitempty"`
 	// Runtime jitter fields (kept for minimal code churn in other modules).
 	PacketHistoryMS        int      `json:"-"`
 	JitterBufferMS         int      `json:"-"`
@@ -505,6 +506,7 @@ func loadConfig(path string) (*Config, error) {
 		cfg.PacerAdaptive.FeedbackEnabled = true
 	}
 	normalizePacerAdaptiveConfig(&cfg.PacerAdaptive)
+	normalizeWeakNetConfig(&cfg.WeakNet)
 	if cfg.SendRateBps <= 0 {
 		cfg.SendRateBps = 20000000
 	}

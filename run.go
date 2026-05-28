@@ -25,6 +25,7 @@ func (r *Relay) Run() error {
 	}
 	r.rtpConn = rtpConn
 	r.rtcpConn = rtcpConn
+	r.initWeakNet()
 	r.setupPacer()
 
 	if err := r.loadMapping(); err != nil {
@@ -50,7 +51,9 @@ func (r *Relay) Run() error {
 		for {
 			time.Sleep(10 * time.Second)
 			r.stats.mu.RLock()
-			log.Printf("[stats] recv=%d sent=%d nacks=%d retrans=%d\n", r.stats.recvPackets, r.stats.sentPackets, r.stats.nackRequests, r.stats.retransmits)
+			log.Printf("[stats] recv=%d sent=%d nacks=%d retrans=%d nack_resolve_fail=%d nack_no_history=%d nack_history_miss=%d nack_late_recovered=%d nack_late_still_miss=%d\n",
+				r.stats.recvPackets, r.stats.sentPackets, r.stats.nackRequests, r.stats.retransmits,
+				r.stats.nackResolveFail, r.stats.nackNoHistory, r.stats.nackHistoryMiss, r.stats.nackLateRecovered, r.stats.nackLateStillMiss)
 			r.stats.mu.RUnlock()
 		}
 	}()

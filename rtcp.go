@@ -225,6 +225,14 @@ func (r *Relay) handleRR(rr *rtcp.ReceiverReport, addr *net.UDPAddr) {
 		if rep.FractionLost > maxFractionLost {
 			maxFractionLost = rep.FractionLost
 		}
+		if r.lossMonitor != nil && addr != nil {
+			key := r.makeWeakNetFlowKey(addr, rep.SSRC, "tx")
+			r.lossMonitor.OnTxRtcpReport(&LossMonitorRTCPReport{
+				Key:            key,
+				FractionLost:   rep.FractionLost,
+				CumulativeLost: rep.TotalLost,
+			}, now)
+		}
 		if rep.LastSenderReport == 0 {
 			continue
 		}
@@ -247,6 +255,10 @@ func (r *Relay) retransmitToMapping(ssrc uint32, pkt []byte) {
 	targets, ok := r.GetMapping(ssrc)
 
 	if ok {
+		writer := r.rtpWriter
+		if writer == nil {
+			writer = r.rtpConn
+		}
 		for _, addr := range targets {
 			if len(pkt) > 4 && false {
 				log.Println("[nack] [retransmit] retransmit to ", addr, "-", ssrc, ":", binary.BigEndian.Uint16(pkt[2:4]))
@@ -254,8 +266,8 @@ func (r *Relay) retransmitToMapping(ssrc uint32, pkt []byte) {
 			if addr == nil {
 				continue
 			}
-			// RTCP-triggered retransmit bypasses pacer and forwards directly.
-			if _, err := r.rtpConn.WriteToUDP(pkt, addr); err != nil {
+			// RTCP-triggered retransmit bypasses pacer queue but still goes through weaknet tx emulation.
+			if _, err := writer.WriteToUDP(pkt, addr); err != nil {
 				log.Printf("[ERROR][rtcp-retransmit] write_failed target=%s ssrc=%d len=%d err=%v",
 					addr.String(), ssrc, len(pkt), err)
 				continue

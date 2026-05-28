@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/bits"
 	"net"
@@ -9,8 +10,137 @@ import (
 	"github.com/pion/rtcp"
 )
 
+const nackLateProbeDelay = 100 * time.Millisecond
+const nackLateProbeMaxSeqBehind = 64
+const nackLateProbeChecks = 3
+const nackLateProbeBatchWindow = 10 * time.Millisecond
+
+type nackProbeBatch struct {
+	ph   *PacketHistory
+	seqs map[uint16]struct{}
+}
+
 func nackPairCount(n rtcp.NackPair) uint64 {
 	return 1 + uint64(bits.OnesCount16(uint16(n.LostPackets)))
+}
+
+func nackProbeKey(ssrc uint32, seq uint16) string {
+	return fmt.Sprintf("%d:%d", ssrc, seq)
+}
+
+func (r *Relay) tryBeginNackProbe(ssrc uint32, seq uint16) bool {
+	key := nackProbeKey(ssrc, seq)
+	r.nackProbeMu.Lock()
+	defer r.nackProbeMu.Unlock()
+	if _, ok := r.nackProbePending[key]; ok {
+		return false
+	}
+	r.nackProbePending[key] = struct{}{}
+	return true
+}
+
+func (r *Relay) endNackProbe(ssrc uint32, seq uint16) {
+	key := nackProbeKey(ssrc, seq)
+	r.nackProbeMu.Lock()
+	delete(r.nackProbePending, key)
+	r.nackProbeMu.Unlock()
+}
+
+func shouldScheduleLateProbe(lastSeq uint16, missedSeq uint16) bool {
+	d, ok := seqAheadDistance(lastSeq, missedSeq)
+	if !ok {
+		return false
+	}
+	return d > 0 && d <= nackLateProbeMaxSeqBehind
+}
+
+func (r *Relay) scheduleLateHistoryProbe(nackSSRC uint32, seq uint16, ph *PacketHistory) {
+	if ph == nil {
+		return
+	}
+	if !r.tryBeginNackProbe(nackSSRC, seq) {
+		return
+	}
+
+	startBatchWorker := false
+	r.nackProbeBatchMu.Lock()
+	batch, ok := r.nackProbeBatches[nackSSRC]
+	if !ok {
+		batch = &nackProbeBatch{
+			ph:   ph,
+			seqs: make(map[uint16]struct{}),
+		}
+		r.nackProbeBatches[nackSSRC] = batch
+		startBatchWorker = true
+	}
+	batch.seqs[seq] = struct{}{}
+	r.nackProbeBatchMu.Unlock()
+
+	if startBatchWorker {
+		go r.runLateHistoryProbeBatch(nackSSRC, batch)
+	}
+}
+
+func (r *Relay) runLateHistoryProbeBatch(nackSSRC uint32, batch *nackProbeBatch) {
+	time.Sleep(nackLateProbeBatchWindow)
+
+	r.nackProbeBatchMu.Lock()
+	current, ok := r.nackProbeBatches[nackSSRC]
+	if !ok || current != batch {
+		r.nackProbeBatchMu.Unlock()
+		return
+	}
+	delete(r.nackProbeBatches, nackSSRC)
+	ph := current.ph
+	seqs := make([]uint16, 0, len(current.seqs))
+	for seq := range current.seqs {
+		seqs = append(seqs, seq)
+	}
+	r.nackProbeBatchMu.Unlock()
+
+	if ph == nil || len(seqs) == 0 {
+		for _, seq := range seqs {
+			r.endNackProbe(nackSSRC, seq)
+		}
+		return
+	}
+
+	remaining := make(map[uint16]struct{}, len(seqs))
+	for _, seq := range seqs {
+		remaining[seq] = struct{}{}
+	}
+
+	for probe := 1; probe <= nackLateProbeChecks && len(remaining) > 0; probe++ {
+		time.Sleep(nackLateProbeDelay)
+		delayMS := int64(probe) * nackLateProbeDelay.Milliseconds()
+		for seq := range remaining {
+			pkt, hit := ph.Get(seq)
+			if !hit {
+				continue
+			}
+			hSize, hMaxMs, hLastAgeMs, hLastSeq := ph.Snapshot(time.Now())
+			r.retransmitToMapping(nackSSRC, pkt)
+			r.stats.mu.Lock()
+			r.stats.retransmits++
+			r.stats.nackLateRecovered++
+			r.stats.mu.Unlock()
+			log.Printf("[nack] late-hit retransmit nackSSRC=%d seq=%d delay_ms=%d history_size=%d history_max_ms=%d last_age_ms=%d last_seq=%d",
+				nackSSRC, seq, delayMS, hSize, hMaxMs, hLastAgeMs, hLastSeq)
+			delete(remaining, seq)
+			r.endNackProbe(nackSSRC, seq)
+		}
+	}
+
+	if len(remaining) == 0 {
+		return
+	}
+
+	r.stats.mu.Lock()
+	r.stats.nackLateStillMiss += uint64(len(remaining))
+	r.stats.mu.Unlock()
+	for seq := range remaining {
+		r.endNackProbe(nackSSRC, seq)
+	}
 }
 
 func rtcpToRtpAddr(addr *net.UDPAddr) string {
@@ -75,13 +205,13 @@ func makeNackPairs(missing []uint16) []rtcp.NackPair {
 }
 
 func (r *Relay) sendNack(senderSSRC uint32, mediaSSRC uint32, missingSeqs []uint16, srcAddr *net.UDPAddr) {
-	remoteSsrc, ok := r.resolveSenderSSRC(senderSSRC, nil, 0)
-	if !ok {
-		log.Printf("[sendNack] cannot resolve remote SSRC for sender=%d\n", senderSSRC)
+	if len(missingSeqs) == 0 || srcAddr == nil {
 		return
 	}
 
-	if len(missingSeqs) == 0 || srcAddr == nil {
+	remoteSsrc, ok := r.resolveSenderSSRC(senderSSRC, nil, mediaSSRC)
+	if !ok {
+		log.Printf("[sendNack] cannot resolve remote SSRC for sender=%d media=%d\n", senderSSRC, mediaSSRC)
 		return
 	}
 
@@ -92,7 +222,7 @@ func (r *Relay) sendNack(senderSSRC uint32, mediaSSRC uint32, missingSeqs []uint
 
 	nack := &rtcp.TransportLayerNack{
 		SenderSSRC: remoteSsrc,
-		MediaSSRC:  0,
+		MediaSSRC:  mediaSSRC,
 		Nacks:      pairs,
 	}
 
@@ -256,6 +386,9 @@ func (r *Relay) handleNack(nack *rtcp.TransportLayerNack, rtcpSrc *net.UDPAddr) 
 
 		nackSSRC, ok := r.resolveSenderSSRC(sender, rtcpSrc, media)
 		if !ok {
+			r.stats.mu.Lock()
+			r.stats.nackResolveFail++
+			r.stats.mu.Unlock()
 			log.Printf("[nack] cannot resolve true SSRC for sender=%d pid=%d blp=%d\n", sender, pid, blp)
 			continue
 		}
@@ -265,7 +398,15 @@ func (r *Relay) handleNack(nack *rtcp.TransportLayerNack, rtcpSrc *net.UDPAddr) 
 		r.historyMutex.Unlock()
 
 		if ph == nil {
-			log.Printf("[nack] no history for nackSSRC=%d\n", nackSSRC)
+			r.stats.mu.Lock()
+			r.stats.nackNoHistory++
+			r.stats.mu.Unlock()
+
+			r.historyMutex.Lock()
+			historyStreams := len(r.history)
+			r.historyMutex.Unlock()
+
+			log.Printf("[nack] no history for nackSSRC=%d history_streams=%d\n", nackSSRC, historyStreams)
 			continue
 		}
 
@@ -275,7 +416,15 @@ func (r *Relay) handleNack(nack *rtcp.TransportLayerNack, rtcpSrc *net.UDPAddr) 
 			r.stats.retransmits++
 			r.stats.mu.Unlock()
 		} else {
-			log.Printf("[nack] history miss nackSSRC=%d seq=%d\n", nackSSRC, pid)
+			r.stats.mu.Lock()
+			r.stats.nackHistoryMiss++
+			r.stats.mu.Unlock()
+			hSize, hMaxMs, hLastAgeMs, hLastSeq := ph.Snapshot(time.Now())
+			log.Printf("[nack] history miss nackSSRC=%d seq=%d history_size=%d history_max_ms=%d last_age_ms=%d last_seq=%d\n",
+				nackSSRC, pid, hSize, hMaxMs, hLastAgeMs, hLastSeq)
+			if shouldScheduleLateProbe(hLastSeq, pid) {
+				r.scheduleLateHistoryProbe(nackSSRC, pid, ph)
+			}
 		}
 
 		for i := uint16(0); i < 16; i++ {
@@ -287,7 +436,15 @@ func (r *Relay) handleNack(nack *rtcp.TransportLayerNack, rtcpSrc *net.UDPAddr) 
 					r.stats.retransmits++
 					r.stats.mu.Unlock()
 				} else {
-					log.Printf("[nack] history miss nackSSRC=%d seq=%d\n", nackSSRC, seq)
+					r.stats.mu.Lock()
+					r.stats.nackHistoryMiss++
+					r.stats.mu.Unlock()
+					hSize, hMaxMs, hLastAgeMs, hLastSeq := ph.Snapshot(time.Now())
+					log.Printf("[nack] history miss nackSSRC=%d seq=%d history_size=%d history_max_ms=%d last_age_ms=%d last_seq=%d\n",
+						nackSSRC, seq, hSize, hMaxMs, hLastAgeMs, hLastSeq)
+					if shouldScheduleLateProbe(hLastSeq, seq) {
+						r.scheduleLateHistoryProbe(nackSSRC, seq, ph)
+					}
 				}
 			}
 		}

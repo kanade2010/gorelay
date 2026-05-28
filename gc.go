@@ -227,10 +227,18 @@ func (r *Relay) updateSSRC() {
 	}
 
 	deadPacers := r.cleanupStalePacers()
+	txWeakNetRemoved := 0
+	rxWeakNetRemoved := 0
+	if r.weaknet != nil {
+		txWeakNetRemoved, rxWeakNetRemoved = r.weaknet.CleanupIdle(now, weakNetDefaultIdleTTL)
+	}
+	if r.lossMonitor != nil {
+		r.lossMonitor.CleanupOld(now)
+	}
 
-	if len(deadSSRC) > 0 || len(deadAddr) > 0 || deadPacers > 0 {
-		log.Printf("[GC] cleaned ssrc=%d addr=%d pacer=%d",
-			len(deadSSRC), len(deadAddr), deadPacers)
+	if len(deadSSRC) > 0 || len(deadAddr) > 0 || deadPacers > 0 || txWeakNetRemoved > 0 || rxWeakNetRemoved > 0 {
+		log.Printf("[GC] cleaned ssrc=%d addr=%d pacer=%d weaknet(tx/rx)=%d/%d",
+			len(deadSSRC), len(deadAddr), deadPacers, txWeakNetRemoved, rxWeakNetRemoved)
 	}
 
 	var reCheckAddr []string

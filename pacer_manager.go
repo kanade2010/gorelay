@@ -248,7 +248,11 @@ func (r *Relay) getOrCreatePacerForTarget(target *net.UDPAddr) (*Pacer, string, 
 
 	params := r.resolvePacerParamsForTargetKey(targetKey)
 	pcfg := pacerConfigFromResolved(params)
-	p := NewPacer(r.rtpConn, pcfg)
+	writer := r.rtpWriter
+	if writer == nil {
+		writer = r.rtpConn
+	}
+	p := NewPacer(writer, pcfg)
 	p.SetMeta(targetKey, "egress")
 	p.SetOnSent(r.onPacerSent)
 

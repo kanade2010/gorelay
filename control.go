@@ -152,6 +152,7 @@ func (r *Relay) applyConfigToRuntime(cfg *Config) {
 		go r.forwardFromJitter(wkr.ssrc, wkr.jb)
 	}
 
+	r.applyWeakNetDefaultsToRuntime()
 	r.applyResolvedParamsToAllPacers()
 }
 
@@ -637,6 +638,7 @@ func (r *Relay) handleUpdateConfig(w http.ResponseWriter, req *http.Request) {
 			"enable_pacer_adaptive": r.cfg.EnablePacerAdaptive,
 			"pacer_adaptive":        r.cfg.PacerAdaptive,
 			"pacer_ip_profiles":     r.cfg.PacerIPProfiles,
+			"weaknet":               r.cfg.WeakNet,
 			"jitter": map[string]any{
 				"enable_jitter":             r.cfg.EnableJitter,
 				"jitter_source_ips_enabled": r.cfg.JitterSourceIPsEnabled,
@@ -701,6 +703,7 @@ func (r *Relay) handleReplaceConfig(w http.ResponseWriter, req *http.Request) {
 			"enable_pacer_adaptive": r.cfg.EnablePacerAdaptive,
 			"pacer_adaptive":        r.cfg.PacerAdaptive,
 			"pacer_ip_profiles":     r.cfg.PacerIPProfiles,
+			"weaknet":               r.cfg.WeakNet,
 			"jitter": map[string]any{
 				"enable_jitter":             r.cfg.EnableJitter,
 				"jitter_source_ips_enabled": r.cfg.JitterSourceIPsEnabled,
@@ -1361,6 +1364,8 @@ func (r *Relay) controlLoop() {
 	http.HandleFunc("/update/pacer", r.handleUpdatePacer)
 	http.HandleFunc("/update/pacer/adaptive", r.handleUpdatePacerAdaptive)
 	http.HandleFunc("/update/pacer/ip", r.handleUpdatePacerIPProfile)
+	http.HandleFunc("/update/weaknet", r.handleUpdateWeakNet)
+	http.HandleFunc("/update/weaknet/flow", r.handleUpdateWeakNetFlow)
 	http.HandleFunc("/update/config", r.handleUpdateConfig)
 	http.HandleFunc("/update/config/replace", r.handleReplaceConfig)
 	http.HandleFunc("/remove-addrmapping", r.handleRemoveAddrMapping)
@@ -1370,6 +1375,9 @@ func (r *Relay) controlLoop() {
 	http.HandleFunc("/update/install", handleInstallUpdate)
 	http.HandleFunc("/debug/network", r.handleNetworkDebug)
 	http.HandleFunc("/debug/network/periods", r.handleNetworkUpdatePeriods)
+	http.HandleFunc("/debug/weaknet/stats", r.handleWeakNetStats)
+	http.HandleFunc("/api/weaknet/loss", r.handleWeakNetLossAPI)
+	http.HandleFunc("/debug/weaknet/loss/page", r.handleWeakNetLossPage)
 	http.HandleFunc("/debug/network/page", r.handleNetworkPage)
 	http.HandleFunc("/debug/stat/print", r.handleStatPrintPage)
 	http.HandleFunc("/debug/stat/print/data", r.handleStatPrintData)

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/pion/rtp"
 )
@@ -186,11 +187,19 @@ func (r *Relay) enqueueToPacer(job ForwardJob) (bool, string) {
 		return pacer.EnqueueWithReason(job, job.prio)
 	}
 
-	if _, err := r.rtpConn.WriteToUDP(job.pkt, job.target); err != nil {
+	writer := r.rtpWriter
+	if writer == nil {
+		writer = r.rtpConn
+	}
+	n, err := writer.WriteToUDP(job.pkt, job.target)
+	if err != nil {
 		log.Println("forward write err:", err)
 		return false, "udp_write_error"
 	}
-	r.onPacerSent(job, len(job.pkt))
+	if n <= 0 {
+		n = len(job.pkt)
+	}
+	r.onPacerSent(job, n)
 	return true, ""
 }
 
@@ -211,7 +220,6 @@ func (r *Relay) onPacerSent(job ForwardJob, _ int) {
 
 func (r *Relay) rtpReadLoop() {
 	buf := make([]byte, 1500)
-	cnt := 0
 	for {
 		n, addr, err := r.rtpConn.ReadFromUDP(buf)
 		if err != nil {
@@ -229,101 +237,121 @@ func (r *Relay) rtpReadLoop() {
 			continue
 		}
 
-		var pkt rtp.Packet
-		if perr := pkt.Unmarshal(data); perr != nil {
-			_, nerr := r.parseNatKeepAlivePacket(data, addr)
-
-			if nerr != nil {
-				log.Println("rtp unmarshal err:", perr)
+		if r.weaknet != nil && looksLikeRTP(data) {
+			seq, ssrc, _ := parseRTPSeqSSRCFast(data)
+			key := r.makeWeakNetFlowKey(addr, ssrc, "rx")
+			if err := r.weaknet.EnqueueRx(key, &WeakNetPacket{
+				Bytes: data,
+				Addr:  addr,
+				Seq:   seq,
+				SSRC:  ssrc,
+			}, time.Now()); err != nil {
+				log.Printf("[weaknet][rx] enqueue failed, fallback direct: src=%s len=%d err=%v", addr.String(), len(data), err)
+				r.handleIncomingRTPPacket(data, addr)
 			}
 			continue
 		}
-		srcAddr := addr.String()
-		srcSSRC := pkt.SSRC
-		r.ssrcTSMux.Lock()
-		r.ssrcTS[srcSSRC] = TimeNow
-		r.ssrcTSMux.Unlock()
-		r.addrTSMux.Lock()
-		r.addrTS[srcAddr] = TimeNow
-		r.addrTSMux.Unlock()
-		r.stats.mu.Lock()
-		r.stats.recvPackets++
-		r.stats.mu.Unlock()
+		r.handleIncomingRTPPacket(data, addr)
+	}
+}
 
-		r.weakStats.UpdateRTP(addr.String(), &pkt)
-		r.handleRtpInput(srcSSRC, pkt.SequenceNumber, addr)
-
-		cnt = cnt + 1
-		if cnt%50 == 0 {
+func (r *Relay) handleIncomingRTPPacket(data []byte, addr *net.UDPAddr) {
+	var pkt rtp.Packet
+	if perr := pkt.Unmarshal(data); perr != nil {
+		_, nerr := r.parseNatKeepAlivePacket(data, addr)
+		if nerr != nil {
+			log.Println("rtp unmarshal err:", perr)
 		}
+		return
+	}
 
-		// r.stats.mu.Lock()
-		// r.stats.recvPackets++
-		// r.stats.mu.Unlock()
+	srcAddr := addr.String()
+	srcSSRC := pkt.SSRC
+	now := time.Now()
+	r.ssrcTSMux.Lock()
+	r.ssrcTS[srcSSRC] = TimeNow
+	r.ssrcTSMux.Unlock()
+	r.addrTSMux.Lock()
+	r.addrTS[srcAddr] = TimeNow
+	r.addrTSMux.Unlock()
+	r.stats.mu.Lock()
+	r.stats.recvPackets++
+	r.stats.mu.Unlock()
 
-		r.addrSsrcMutex.RLock()
-		lst, exists := r.addrSsrc[srcAddr]
-		r.addrSsrcMutex.RUnlock()
-		if !exists {
+	if r.lossMonitor != nil {
+		key := r.makeWeakNetFlowKey(addr, srcSSRC, "rx")
+		r.lossMonitor.OnRxPacketSeq(&LossMonitorPacket{
+			Key:  key,
+			Seq:  pkt.SequenceNumber,
+			SSRC: srcSSRC,
+		}, now)
+	}
+
+	r.weakStats.UpdateRTP(addr.String(), &pkt)
+	r.handleRtpInput(srcSSRC, pkt.SequenceNumber, addr)
+
+	r.addrSsrcMutex.RLock()
+	lst, exists := r.addrSsrc[srcAddr]
+	r.addrSsrcMutex.RUnlock()
+	if !exists {
+		r.addrSsrcMutex.Lock()
+		r.addrSsrc[srcAddr] = []uint32{srcSSRC}
+		r.addrSsrcMutex.Unlock()
+	} else {
+		add := true
+		for _, a := range lst {
+			if a == srcSSRC {
+				add = false
+			}
+		}
+		if add {
 			r.addrSsrcMutex.Lock()
-			r.addrSsrc[srcAddr] = []uint32{srcSSRC}
+			r.addrSsrc[srcAddr] = append(lst, srcSSRC)
 			r.addrSsrcMutex.Unlock()
-		} else {
-			add := true
-			for _, a := range lst {
-				if a == srcSSRC {
-					add = false
-				}
-			}
-			if add {
-				r.addrSsrcMutex.Lock()
-				r.addrSsrc[srcAddr] = append(lst, srcSSRC)
-				r.addrSsrcMutex.Unlock()
-			}
 		}
+	}
 
-		r.historyMutex.Lock()
-		ph, ok := r.history[srcSSRC]
-		var jb *JitterBuffer
-		startJitterForwarder := false
-		useJitterForPacket := r.shouldUseJitterForSource(addr)
-		if ok {
-			jb = r.jitter[srcSSRC]
-		} else {
-			ph = NewPacketHistory(r.cfg.PacketHistoryMS)
-			r.history[srcSSRC] = ph
-			jb = NewJitterBuffer(
-				r.cfg.EnableJitter,
-				r.cfg.JitterMinDelayMS,
-				r.cfg.JitterMaxDelayMS,
-				r.cfg.JitterTickMS,
-				r.cfg.JitterUpStepMS,
-				r.cfg.JitterDownStepMS,
-				r.cfg.JitterLogEnabled,
-				r.cfg.JitterLogPeriodMS,
-				fmt.Sprintf("ssrc=%d", srcSSRC),
-			)
-			r.jitter[srcSSRC] = jb
-			log.Printf("new ssrc seen: %d from %s\n", srcSSRC, addr)
-		}
-		if useJitterForPacket && jb != nil && !r.jitterForwarders[srcSSRC] {
-			r.jitterForwarders[srcSSRC] = true
-			startJitterForwarder = true
-		}
-		r.historyMutex.Unlock()
-		ph.Add(&pkt, data)
+	r.historyMutex.Lock()
+	ph, ok := r.history[srcSSRC]
+	var jb *JitterBuffer
+	startJitterForwarder := false
+	useJitterForPacket := r.shouldUseJitterForSource(addr)
+	if ok {
+		jb = r.jitter[srcSSRC]
+	} else {
+		ph = NewPacketHistory(r.cfg.PacketHistoryMS)
+		r.history[srcSSRC] = ph
+		jb = NewJitterBuffer(
+			r.cfg.EnableJitter,
+			r.cfg.JitterMinDelayMS,
+			r.cfg.JitterMaxDelayMS,
+			r.cfg.JitterTickMS,
+			r.cfg.JitterUpStepMS,
+			r.cfg.JitterDownStepMS,
+			r.cfg.JitterLogEnabled,
+			r.cfg.JitterLogPeriodMS,
+			fmt.Sprintf("ssrc=%d", srcSSRC),
+		)
+		r.jitter[srcSSRC] = jb
+		log.Printf("new ssrc seen: %d from %s\n", srcSSRC, addr)
+	}
+	if useJitterForPacket && jb != nil && !r.jitterForwarders[srcSSRC] {
+		r.jitterForwarders[srcSSRC] = true
+		startJitterForwarder = true
+	}
+	r.historyMutex.Unlock()
+	ph.Add(&pkt, data)
 
-		if startJitterForwarder {
-			log.Printf("[jitter][ssrc=%d] start forward worker", srcSSRC)
-			go r.forwardFromJitter(srcSSRC, jb)
-		}
+	if startJitterForwarder {
+		log.Printf("[jitter][ssrc=%d] start forward worker", srcSSRC)
+		go r.forwardFromJitter(srcSSRC, jb)
+	}
 
-		if jb != nil && useJitterForPacket {
-			r.ensureMappingForSSRC(srcSSRC, srcAddr)
-			jb.SafeAdd(pkt.SequenceNumber, data)
-		} else {
-			r.forwardToTargets(srcSSRC, srcAddr, data)
-		}
+	if jb != nil && useJitterForPacket {
+		r.ensureMappingForSSRC(srcSSRC, srcAddr)
+		jb.SafeAdd(pkt.SequenceNumber, data)
+	} else {
+		r.forwardToTargets(srcSSRC, srcAddr, data)
 	}
 }
 

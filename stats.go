@@ -259,10 +259,15 @@ func (ws *WeakNetStats) Export(lastN int) map[string]any {
 }
 
 type Stats struct {
-	mu           sync.RWMutex
-	recvPackets  uint64
-	sentPackets  uint64
-	nackRequests uint64
-	retransmits  uint64
-	lastUpdated  time.Time
+	mu                sync.RWMutex
+	recvPackets       uint64
+	sentPackets       uint64
+	nackRequests      uint64
+	retransmits       uint64
+	nackResolveFail   uint64
+	nackNoHistory     uint64
+	nackHistoryMiss   uint64
+	nackLateRecovered uint64
+	nackLateStillMiss uint64
+	lastUpdated       time.Time
 }

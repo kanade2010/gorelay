@@ -28,6 +28,7 @@ type Relay struct {
 	cfg               *Config
 	rtpConn           *net.UDPConn
 	rtcpConn          *net.UDPConn
+	rtpWriter         UDPPacketWriter
 	mapping           map[uint32][]*net.UDPAddr
 	addrMapping       map[string][]*net.UDPAddr
 	addrSsrc          map[string][]uint32
@@ -64,10 +65,16 @@ type Relay struct {
 	pacerMux         sync.RWMutex
 	pacerCfgMux      sync.RWMutex
 	pacerOverrides   map[string]PacerTargetConfig
+	weaknet          *WeakNetEmulation
+	lossMonitor      *LossMonitor
 	pcapCapture      PcapCaptureState
 	pcapCaptureMux   sync.Mutex
 	pcapCaptureCmd   any
 	pcapCaptureTimer *time.Timer
+	nackProbeMu      sync.Mutex
+	nackProbePending map[string]struct{}
+	nackProbeBatchMu sync.Mutex
+	nackProbeBatches map[uint32]*nackProbeBatch
 }
 
 func NewRelay(cfg *Config) *Relay {
@@ -92,10 +99,13 @@ func NewRelay(cfg *Config) *Relay {
 			Period:       1 * time.Second,
 			MaxWin:       60,
 		},
-		addrTS:         make(map[string]time.Time),
-		rtcpSRSeen:     make(map[string]time.Time),
-		forwardQueue:   make(chan ForwardJob, 8192),
-		pacers:         make(map[string]*Pacer),
-		pacerOverrides: make(map[string]PacerTargetConfig),
+		addrTS:           make(map[string]time.Time),
+		rtcpSRSeen:       make(map[string]time.Time),
+		forwardQueue:     make(chan ForwardJob, 8192),
+		pacers:           make(map[string]*Pacer),
+		pacerOverrides:   make(map[string]PacerTargetConfig),
+		lossMonitor:      NewLossMonitor(lossMonitorDefaultMaxSeconds),
+		nackProbePending: make(map[string]struct{}),
+		nackProbeBatches: make(map[uint32]*nackProbeBatch),
 	}
 }
